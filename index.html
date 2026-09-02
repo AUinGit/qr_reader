@@ -75,8 +75,7 @@
   <p>
     カメラ使用を許可して、画面にQRコードを映してください。<br>
     読み取られたQRコードは下のリストに<strong>一度だけ</strong>追加されます。<br>
-    URL形式のものはクリック可能なリンクになります。<br>
-    通常検出を優先しつつ、足りないときだけ中央寄りの軽い追加解析を行います。
+    URL形式のものはクリック可能なリンクになります。
   </p>
 
   <div id="loadingMessage">
@@ -102,15 +101,14 @@
     const outputMessage = document.getElementById("outputMessage");
     const resultsContainer = document.getElementById("resultsContainer");
 
+    // 検出済みコード（重複防止）
     const seenCodes = new Set();
     let resultCount = 0;
 
+    // 誤検出防止用：同じ内容が何フレーム続いたら確定とみなすか
     const STABLE_THRESHOLD = 3;
     let currentCandidate = null;
     let currentCandidateCount = 0;
-
-    const offscreenCanvas = document.createElement("canvas");
-    const offscreenCtx = offscreenCanvas.getContext("2d", { willReadFrequently: true });
 
     function drawLine(begin, end, color) {
       canvas.beginPath();
@@ -163,7 +161,7 @@
       resultsContainer.appendChild(div);
     }
 
-    // 簡易グレースケール＋コントラスト（1画素単位、ぼかしなし）
+    // 簡易グレースケール＋コントラスト（軽量版）
     function enhanceSimple(imageData) {
       const data = imageData.data;
       const contrast = 1.5;
@@ -184,73 +182,13 @@
       return imageData;
     }
 
-    // 画面中央70%だけを、2スケールで簡易解析（軽い湾曲・しわ用）
-    function findCodeInCenterROI(videoWidth, videoHeight) {
-      const W = videoWidth;
-      const H = videoHeight;
-
-      const roiScale = 0.7;
-      const sw = W * roiScale;
-      const sh = H * roiScale;
-      const sx = (W - sw) / 2;
-      const sy = (H - sh) / 2;
-
-      const targetWidths = [360, 260]; // 軽めのマルチスケール
-
-      for (const tw of targetWidths) {
-        const scale = tw / sw;
-        const th = Math.max(80, Math.floor(sh * scale));
-
-        offscreenCanvas.width = tw;
-        offscreenCanvas.height = th;
-        offscreenCtx.imageSmoothingEnabled = false;
-
-        offscreenCtx.drawImage(
-          video,
-          sx, sy, sw, sh,
-          0, 0, tw, th
-        );
-
-        let img = offscreenCtx.getImageData(0, 0, tw, th);
-        img = enhanceSimple(img);
-
-        const code = jsQR(img.data, img.width, img.height, {
-          inversionAttempts: "attemptBoth",
-        });
-
-        if (code) {
-          const invScale = 1 / scale;
-
-          function mapPoint(p) {
-            return {
-              x: sx + p.x * invScale,
-              y: sy + p.y * invScale,
-            };
-          }
-
-          const mappedLocation = {
-            topLeftCorner: mapPoint(code.location.topLeftCorner),
-            topRightCorner: mapPoint(code.location.topRightCorner),
-            bottomRightCorner: mapPoint(code.location.bottomRightCorner),
-            bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
-          };
-
-          return {
-            data: code.data,
-            location: mappedLocation,
-          };
-        }
-      }
-
-      return null;
-    }
-
-    // カメラ取得
+    // カメラ取得（フレームレート高めにリクエスト）
     navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: "environment",
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width:  { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30, max: 60 }
       }
     })
       .then(stream => {
@@ -299,11 +237,6 @@
           });
         }
 
-        // 3. それでも見つからなければ、中央ROIマルチスケール（軽量版）
-        if (!code) {
-          code = findCodeInCenterROI(canvasElement.width, canvasElement.height);
-        }
-
         if (code) {
           drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
           drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
@@ -332,4 +265,3 @@
   </script>
 </body>
 </html>
-
