@@ -21,6 +21,15 @@
       margin: 10px 0;
     }
 
+    #controls {
+      margin-bottom: 10px;
+    }
+
+    #controls button {
+      padding: 6px 12px;
+      margin-right: 8px;
+    }
+
     #loadingMessage {
       text-align: center;
       padding: 20px;
@@ -72,14 +81,19 @@
 <body>
   <h1>QRコードリーダー（カメラ）</h1>
 
+  <div id="controls">
+    <button id="startButton">カメラ開始</button>
+    <button id="stopButton" disabled>カメラ停止</button>
+  </div>
+
   <p>
-    カメラ使用を許可して、画面にQRコードを映してください。<br>
+    カメラを開始して、画面にQRコードを映してください。<br>
     読み取られたQRコードは下のリストに<strong>一度だけ</strong>追加されます。<br>
     URL形式のものはクリック可能なリンクになります。
   </p>
 
   <div id="loadingMessage">
-    ビデオストリームにアクセスできません（Webカメラが有効になっているか確認してください）
+    カメラは停止中です。「カメラ開始」ボタンを押してください。
   </div>
 
   <canvas id="canvas" hidden></canvas>
@@ -100,15 +114,19 @@
     const outputContainer = document.getElementById("output");
     const outputMessage = document.getElementById("outputMessage");
     const resultsContainer = document.getElementById("resultsContainer");
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
 
-    // 検出済みコード（重複防止）
     const seenCodes = new Set();
     let resultCount = 0;
 
-    // 誤検出防止用：同じ内容が何フレーム続いたら確定とみなすか
     const STABLE_THRESHOLD = 3;
     let currentCandidate = null;
     let currentCandidateCount = 0;
+
+    let stream = null;
+    let running = false;
+    let tickHandle = null;
 
     function drawLine(begin, end, color) {
       canvas.beginPath();
@@ -161,7 +179,6 @@
       resultsContainer.appendChild(div);
     }
 
-    // 簡易グレースケール＋コントラスト（軽量版）
     function enhanceSimple(imageData) {
       const data = imageData.data;
       const contrast = 1.5;
@@ -182,26 +199,61 @@
       return imageData;
     }
 
-    // カメラ取得（フレームレート高めにリクエスト）
-    navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "environment",
-        width:  { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30, max: 60 }
-      }
-    })
-      .then(stream => {
+    async function startCamera() {
+      if (running) return;
+      try {
+        loadingMessage.innerText = "カメラを起動中です...";
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "environment",
+            width:  { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30, max: 60 }
+          }
+        });
+
         video.srcObject = stream;
         video.setAttribute("playsinline", true);
-        video.play();
-        requestAnimationFrame(tick);
-      })
-      .catch(err => {
+        await video.play();
+
+        running = true;
+        startButton.disabled = true;
+        stopButton.disabled = false;
+
+        tickHandle = requestAnimationFrame(tick);
+      } catch (err) {
         loadingMessage.innerText = "カメラにアクセスできません: " + err.message;
-      });
+      }
+    }
+
+    function stopCamera() {
+      if (!running) return;
+
+      running = false;
+
+      if (tickHandle !== null) {
+        cancelAnimationFrame(tickHandle);
+        tickHandle = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+
+      video.srcObject = null;
+
+      loadingMessage.innerText = "カメラは停止中です。「カメラ開始」ボタンを押してください。";
+      canvasElement.hidden = true;
+      outputContainer.hidden = false; // 結果はそのまま見えるように
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+    }
 
     function tick() {
+      if (!running) return;
+
       loadingMessage.innerText = "Loading video...";
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         loadingMessage.hidden = true;
@@ -260,8 +312,12 @@
           currentCandidateCount = 0;
         }
       }
-      requestAnimationFrame(tick);
+
+      tickHandle = requestAnimationFrame(tick);
     }
+
+    startButton.addEventListener("click", startCamera);
+    stopButton.addEventListener("click", stopCamera);
   </script>
 </body>
 </html>
