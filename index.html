@@ -38,6 +38,7 @@
       margin-bottom: 10px;
     }
 
+    /* 表示用キャンバス（見た目用） */
     #canvas {
       width: 100%;
       border-radius: 8px;
@@ -108,14 +109,20 @@
 
   <script>
     const video = document.createElement("video");
-    const canvasElement = document.getElementById("canvas");
-    const canvas = canvasElement.getContext("2d");
+    const displayCanvas = document.getElementById("canvas");       // 表示用
+    const displayCtx = displayCanvas.getContext("2d");
     const loadingMessage = document.getElementById("loadingMessage");
     const outputContainer = document.getElementById("output");
     const outputMessage = document.getElementById("outputMessage");
     const resultsContainer = document.getElementById("resultsContainer");
     const startButton = document.getElementById("startButton");
     const stopButton = document.getElementById("stopButton");
+
+    // 解析用の小さいキャンバス（ユーザーには見せない）
+    const scanCanvas = document.createElement("canvas");
+    const scanCtx = scanCanvas.getContext("2d", { willReadFrequently: true });
+    const SCAN_WIDTH = 640;
+    const SCAN_HEIGHT = 360;
 
     const seenCodes = new Set();
     let resultCount = 0;
@@ -127,14 +134,15 @@
     let stream = null;
     let running = false;
     let tickHandle = null;
+    let frameCounter = 0; // フレーム間引き用
 
     function drawLine(begin, end, color) {
-      canvas.beginPath();
-      canvas.moveTo(begin.x, begin.y);
-      canvas.lineTo(end.x, end.y);
-      canvas.lineWidth = 4;
-      canvas.strokeStyle = color;
-      canvas.stroke();
+      displayCtx.beginPath();
+      displayCtx.moveTo(begin.x, begin.y);
+      displayCtx.lineTo(end.x, end.y);
+      displayCtx.lineWidth = 4;
+      displayCtx.strokeStyle = color;
+      displayCtx.stroke();
     }
 
     function isUrlLike(text) {
@@ -179,6 +187,7 @@
       resultsContainer.appendChild(div);
     }
 
+    // 軽量なグレースケール＋コントラスト
     function enhanceSimple(imageData) {
       const data = imageData.data;
       const contrast = 1.5;
@@ -244,8 +253,8 @@
       video.srcObject = null;
 
       loadingMessage.innerText = "カメラは停止中です。「カメラ開始」ボタンを押してください。";
-      canvasElement.hidden = true;
-      outputContainer.hidden = false; // 結果はそのまま見えるように
+      displayCanvas.hidden = true;
+      outputContainer.hidden = false;
 
       startButton.disabled = false;
       stopButton.disabled = true;
@@ -256,44 +265,77 @@
 
       loadingMessage.innerText = "Loading video...";
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        loadingMessage.hidden = true;
-        canvasElement.hidden = false;
+        loadingMessage.hidden = false; // メッセージ自体は表示したままでもOK
+        displayCanvas.hidden = false;
         outputContainer.hidden = false;
 
-        canvasElement.width = video.videoWidth;
-        canvasElement.height = video.videoHeight;
-        canvas.imageSmoothingEnabled = false;
+        // 表示キャンバスのサイズを動画に合わせる（見た目用）
+        displayCanvas.width = video.videoWidth;
+        displayCanvas.height = video.videoHeight;
+        displayCtx.imageSmoothingEnabled = true;
 
-        canvas.drawImage(video, 0, 0, canvasElement.width, canvasElement.height);
+        // 動画フレームをそのまま表示キャンバスに描画
+        displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
-        const baseImageData = canvas.getImageData(0, 0, canvasElement.width, canvasElement.height);
+        // フレーム間引き：2フレームに1回だけ解析
+        frameCounter++;
+        if (frameCounter % 2 === 0) {
+          tickHandle = requestAnimationFrame(tick);
+          return;
+        }
+
+        // 解析用の小さいキャンバスに縮小描画（オリジナル→SCAN_WIDTH×SCAN_HEIGHT）
+        scanCanvas.width = SCAN_WIDTH;
+        scanCanvas.height = SCAN_HEIGHT;
+        scanCtx.imageSmoothingEnabled = false;
+        scanCtx.drawImage(video, 0, 0, SCAN_WIDTH, SCAN_HEIGHT);
+
+        const scanImageData = scanCtx.getImageData(0, 0, SCAN_WIDTH, SCAN_HEIGHT);
 
         let code = null;
 
-        // 1. 標準：フルフレーム生画像
-        code = jsQR(baseImageData.data, baseImageData.width, baseImageData.height, {
+        // 1. 生画像で解析
+        code = jsQR(scanImageData.data, SCAN_WIDTH, SCAN_HEIGHT, {
           inversionAttempts: "attemptBoth",
         });
 
-        // 2. まだ見つからなければ、フルフレーム簡易強調画像
+        // 2. まだ見つからなければ簡易強調して再解析
         if (!code) {
           const enhanced = enhanceSimple(
             new ImageData(
-              new Uint8ClampedArray(baseImageData.data),
-              baseImageData.width,
-              baseImageData.height
+              new Uint8ClampedArray(scanImageData.data),
+              SCAN_WIDTH,
+              SCAN_HEIGHT
             )
           );
-          code = jsQR(enhanced.data, enhanced.width, enhanced.height, {
+          code = jsQR(enhanced.data, SCAN_WIDTH, SCAN_HEIGHT, {
             inversionAttempts: "attemptBoth",
           });
         }
 
         if (code) {
-          drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
-          drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
-          drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, "#FF3B58");
-          drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, "#FF3B58");
+          // 解析キャンバス座標 → 表示キャンバス座標にスケールして枠線を描く
+          const scaleX = displayCanvas.width / SCAN_WIDTH;
+          const scaleY = displayCanvas.height / SCAN_HEIGHT;
+
+          function mapPoint(p) {
+            return {
+              x: p.x * scaleX,
+              y: p.y * scaleY,
+            };
+          }
+
+          const loc = {
+            topLeftCorner: mapPoint(code.location.topLeftCorner),
+            topRightCorner: mapPoint(code.location.topRightCorner),
+            bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+            bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+          };
+
+          drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
+          drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
+          drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
+          drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
 
           const text = code.data;
 
