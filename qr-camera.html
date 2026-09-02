@@ -1,0 +1,335 @@
+<!-- qr-camera.html -->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>QRコードリーダー（カメラ）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      color: #333;
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 10px;
+      box-sizing: border-box;
+    }
+
+    h1 {
+      font-size: 22px;
+      margin: 10px 0;
+    }
+
+    #loadingMessage {
+      text-align: center;
+      padding: 20px;
+      background-color: #eee;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+
+    #canvas {
+      width: 100%;
+      border-radius: 8px;
+      background: #000;
+    }
+
+    #output {
+      margin-top: 16px;
+      background: #eee;
+      padding: 10px;
+      border-radius: 8px;
+    }
+
+    #output div {
+      padding-bottom: 6px;
+      word-wrap: break-word;
+    }
+
+    .result-item {
+      font-family: monospace;
+      white-space: pre-wrap;
+      padding: 4px 6px;
+      margin-bottom: 4px;
+      background: #fff;
+      border-radius: 4px;
+    }
+
+    .result-item-index {
+      font-weight: bold;
+      margin-right: 4px;
+    }
+
+    .result-link {
+      color: #0066cc;
+      text-decoration: underline;
+      word-break: break-all;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>QRコードリーダー（カメラ）</h1>
+
+  <p>
+    カメラ使用を許可して、画面にQRコードを映してください。<br>
+    読み取られたQRコードは下のリストに<strong>一度だけ</strong>追加されます。<br>
+    URL形式のものはクリック可能なリンクになります。<br>
+    通常検出を優先しつつ、足りないときだけ中央寄りの軽い追加解析を行います。
+  </p>
+
+  <div id="loadingMessage">
+    ビデオストリームにアクセスできません（Webカメラが有効になっているか確認してください）
+  </div>
+
+  <canvas id="canvas" hidden></canvas>
+
+  <div id="output" hidden>
+    <div id="outputMessage">まだQRコードは検出されていません。</div>
+    <div id="resultsContainer"></div>
+  </div>
+
+  <!-- jsQRライブラリ（CDN） -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
+  <script>
+    const video = document.createElement("video");
+    const canvasElement = document.getElementById("canvas");
+    const canvas = canvasElement.getContext("2d");
+    const loadingMessage = document.getElementById("loadingMessage");
+    const outputContainer = document.getElementById("output");
+    const outputMessage = document.getElementById("outputMessage");
+    const resultsContainer = document.getElementById("resultsContainer");
+
+    const seenCodes = new Set();
+    let resultCount = 0;
+
+    const STABLE_THRESHOLD = 3;
+    let currentCandidate = null;
+    let currentCandidateCount = 0;
+
+    const offscreenCanvas = document.createElement("canvas");
+    const offscreenCtx = offscreenCanvas.getContext("2d", { willReadFrequently: true });
+
+    function drawLine(begin, end, color) {
+      canvas.beginPath();
+      canvas.moveTo(begin.x, begin.y);
+      canvas.lineTo(end.x, end.y);
+      canvas.lineWidth = 4;
+      canvas.strokeStyle = color;
+      canvas.stroke();
+    }
+
+    function isUrlLike(text) {
+      return /^https?:\/\/[^\s]+$/i.test(text.trim());
+    }
+
+    function addResult(codeText) {
+      if (seenCodes.has(codeText)) return;
+
+      seenCodes.add(codeText);
+      resultCount++;
+
+      if (resultCount === 1) {
+        outputMessage.textContent = "検出されたQRコード一覧：";
+      }
+
+      const div = document.createElement("div");
+      div.className = "result-item";
+
+      const indexSpan = document.createElement("span");
+      indexSpan.className = "result-item-index";
+      indexSpan.textContent = "[" + resultCount + "]";
+
+      const contentSpan = document.createElement("span");
+      const trimmed = codeText.trim();
+
+      if (isUrlLike(trimmed)) {
+        const a = document.createElement("a");
+        a.href = trimmed;
+        a.textContent = trimmed;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.className = "result-link";
+        contentSpan.appendChild(document.createTextNode(" "));
+        contentSpan.appendChild(a);
+      } else {
+        contentSpan.textContent = " " + codeText;
+      }
+
+      div.appendChild(indexSpan);
+      div.appendChild(contentSpan);
+      resultsContainer.appendChild(div);
+    }
+
+    // 簡易グレースケール＋コントラスト（1画素単位、ぼかしなし）
+    function enhanceSimple(imageData) {
+      const data = imageData.data;
+      const contrast = 1.5;
+      const mid = 128;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        let v = 0.299 * r + 0.587 * g + 0.114 * b;
+        v = (v - mid) * contrast + mid;
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+
+        data[i] = data[i + 1] = data[i + 2] = v;
+      }
+      return imageData;
+    }
+
+    // 画面中央70%だけを、2スケールで簡易解析（軽い湾曲・しわ用）
+    function findCodeInCenterROI(videoWidth, videoHeight) {
+      const W = videoWidth;
+      const H = videoHeight;
+
+      const roiScale = 0.7;
+      const sw = W * roiScale;
+      const sh = H * roiScale;
+      const sx = (W - sw) / 2;
+      const sy = (H - sh) / 2;
+
+      const targetWidths = [360, 260]; // 軽めのマルチスケール
+
+      for (const tw of targetWidths) {
+        const scale = tw / sw;
+        const th = Math.max(80, Math.floor(sh * scale));
+
+        offscreenCanvas.width = tw;
+        offscreenCanvas.height = th;
+        offscreenCtx.imageSmoothingEnabled = false;
+
+        offscreenCtx.drawImage(
+          video,
+          sx, sy, sw, sh,
+          0, 0, tw, th
+        );
+
+        let img = offscreenCtx.getImageData(0, 0, tw, th);
+        img = enhanceSimple(img);
+
+        const code = jsQR(img.data, img.width, img.height, {
+          inversionAttempts: "attemptBoth",
+        });
+
+        if (code) {
+          const invScale = 1 / scale;
+
+          function mapPoint(p) {
+            return {
+              x: sx + p.x * invScale,
+              y: sy + p.y * invScale,
+            };
+          }
+
+          const mappedLocation = {
+            topLeftCorner: mapPoint(code.location.topLeftCorner),
+            topRightCorner: mapPoint(code.location.topRightCorner),
+            bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+            bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+          };
+
+          return {
+            data: code.data,
+            location: mappedLocation,
+          };
+        }
+      }
+
+      return null;
+    }
+
+    // カメラ取得
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    })
+      .then(stream => {
+        video.srcObject = stream;
+        video.setAttribute("playsinline", true);
+        video.play();
+        requestAnimationFrame(tick);
+      })
+      .catch(err => {
+        loadingMessage.innerText = "カメラにアクセスできません: " + err.message;
+      });
+
+    function tick() {
+      loadingMessage.innerText = "Loading video...";
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        loadingMessage.hidden = true;
+        canvasElement.hidden = false;
+        outputContainer.hidden = false;
+
+        canvasElement.width = video.videoWidth;
+        canvasElement.height = video.videoHeight;
+        canvas.imageSmoothingEnabled = false;
+
+        canvas.drawImage(video, 0, 0, canvasElement.width, canvasElement.height);
+
+        const baseImageData = canvas.getImageData(0, 0, canvasElement.width, canvasElement.height);
+
+        let code = null;
+
+        // 1. 標準：フルフレーム生画像
+        code = jsQR(baseImageData.data, baseImageData.width, baseImageData.height, {
+          inversionAttempts: "attemptBoth",
+        });
+
+        // 2. まだ見つからなければ、フルフレーム簡易強調画像
+        if (!code) {
+          const enhanced = enhanceSimple(
+            new ImageData(
+              new Uint8ClampedArray(baseImageData.data),
+              baseImageData.width,
+              baseImageData.height
+            )
+          );
+          code = jsQR(enhanced.data, enhanced.width, enhanced.height, {
+            inversionAttempts: "attemptBoth",
+          });
+        }
+
+        // 3. それでも見つからなければ、中央ROIマルチスケール（軽量版）
+        if (!code) {
+          code = findCodeInCenterROI(canvasElement.width, canvasElement.height);
+        }
+
+        if (code) {
+          drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
+          drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
+          drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, "#FF3B58");
+          drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, "#FF3B58");
+
+          const text = code.data;
+
+          if (text === currentCandidate) {
+            currentCandidateCount++;
+          } else {
+            currentCandidate = text;
+            currentCandidateCount = 1;
+          }
+
+          if (currentCandidateCount === STABLE_THRESHOLD) {
+            addResult(text);
+          }
+        } else {
+          currentCandidate = null;
+          currentCandidateCount = 0;
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+  </script>
+</body>
+</html>
+
