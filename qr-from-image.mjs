@@ -11,11 +11,11 @@
   const startButton = document.getElementById("startButton");
   const stopButton = document.getElementById("stopButton");
 
-  // すでに追加したQRコードの中身（重複防止）
+  // すでにリストに追加済みのQR文字列
   const seenCodes = new Set();
   let resultCount = 0;
 
-  // 誤検出対策用（簡易）：直近コードの安定判定
+  // 安定判定（簡易）：最後に読んだ候補と何フレーム連続か
   const STABLE_THRESHOLD = 3;
   let currentCandidate = null;
   let currentCandidateCount = 0;
@@ -24,11 +24,14 @@
   let running = false;
   let tickHandle = null;
 
+  // 「次に探すべき領域」のインデックス（0〜3を循環）
+  let nextRegionIndex = 0;
+
   function isUrlLike(text) {
     return /^https?:\/\/[^\s]+$/i.test(text.trim());
   }
 
-  // 軽量グレースケール＋コントラスト強調
+  // 軽量グレースケール＋コントラスト
   function enhanceSimple(imageData) {
     const data = imageData.data;
     const contrast = 1.5;
@@ -45,7 +48,6 @@
       if (v > 255) v = 255;
 
       data[i] = data[i + 1] = data[i + 2] = v;
-      // alpha はそのまま
     }
     return imageData;
   }
@@ -126,8 +128,13 @@
       stopButton.disabled = false;
 
       overlayText.classList.add("hidden");
-      statusText.textContent = "カメラ起動中。複数のQRコードを同時に映してもOKです。";
+      statusText.textContent = "カメラ起動中。複数のQRコードを順番に読み取ります。";
       canvas.hidden = false;
+
+      // リセット
+      currentCandidate = null;
+      currentCandidateCount = 0;
+      nextRegionIndex = 0;
 
       tickHandle = requestAnimationFrame(tick);
     } catch (err) {
@@ -163,77 +170,73 @@
   }
 
   /**
-   * 1フレームを 2x2 の4分割にして、それぞれで jsQR を走らせる
-   * 複数ヒットしたら、同じ文字列は除外しつつ全部返す
+   * 画面を 2x2 の4領域に分け、指定された regionIndex の領域だけを解析する。
+   * 見つかった場合だけそのコードを返し、なければ null を返す。
    */
-  function findCodesMultiRegion(imageData) {
+  function findOneCodeInRegion(imageData, regionIndex) {
     const { width, height } = imageData;
-    const codes = [];
-    const foundTexts = new Set();
 
     const halfW = Math.floor(width / 2);
     const halfH = Math.floor(height / 2);
 
     const regions = [
-      { x: 0,      y: 0,       w: halfW,        h: halfH },          // 左上
-      { x: halfW,  y: 0,       w: width-halfW,  h: halfH },          // 右上
-      { x: 0,      y: halfH,   w: halfW,        h: height-halfH },   // 左下
-      { x: halfW,  y: halfH,   w: width-halfW,  h: height-halfH }    // 右下
+      { x: 0,      y: 0,       w: halfW,        h: halfH },          // 0: 左上
+      { x: halfW,  y: 0,       w: width-halfW,  h: halfH },          // 1: 右上
+      { x: 0,      y: halfH,   w: halfW,        h: height-halfH },   // 2: 左下
+      { x: halfW,  y: halfH,   w: width-halfW,  h: height-halfH }    // 3: 右下
     ];
 
-    for (const region of regions) {
-      const { x, y, w, h } = region;
+    const region = regions[regionIndex];
+    const { x, y, w, h } = region;
 
-      // region用の ImageData を切り出す
-      const regionData = ctx.getImageData(x, y, w, h);
+    // 領域を切り出し
+    const regionData = ctx.getImageData(x, y, w, h);
 
-      // まず生で試す
-      let code = jsQR(regionData.data, w, h, { inversionAttempts: "attemptBoth" });
+    // 生画像で試す
+    let code = jsQR(regionData.data, w, h, { inversionAttempts: "attemptBoth" });
 
-      // ダメなら軽い強調
-      if (!code) {
-        const enhanced = enhanceSimple(
-          new ImageData(
-            new Uint8ClampedArray(regionData.data),
-            w,
-            h
-          )
-        );
-        code = jsQR(enhanced.data, w, h, { inversionAttempts: "attemptBoth" });
-      }
-
-      if (code) {
-        const text = code.data;
-        if (foundTexts.has(text)) continue;
-        foundTexts.add(text);
-
-        // 領域内座標 → 全体キャンバス座標
-        function mapPoint(p) {
-          return { x: p.x + x, y: p.y + y };
-        }
-
-        const mappedLocation = {
-          topLeftCorner: mapPoint(code.location.topLeftCorner),
-          topRightCorner: mapPoint(code.location.topRightCorner),
-          bottomRightCorner: mapPoint(code.location.bottomRightCorner),
-          bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
-        };
-
-        codes.push({
-          data: text,
-          location: mappedLocation
-        });
-      }
+    // ダメなら軽く強調して再トライ
+    if (!code) {
+      const enhanced = enhanceSimple(
+        new ImageData(
+          new Uint8ClampedArray(regionData.data),
+          w,
+          h
+        )
+      );
+      code = jsQR(enhanced.data, w, h, { inversionAttempts: "attemptBoth" });
     }
 
-    return codes;
+    if (!code) return null;
+
+    // すでにリストにあるものなら「もう読んだ」とみなしてスキップ
+    if (seenCodes.has(code.data)) {
+      return null;
+    }
+
+    // 領域内座標 → 全体キャンバス座標に変換
+    function mapPoint(p) {
+      return { x: p.x + x, y: p.y + y };
+    }
+
+    const mappedLocation = {
+      topLeftCorner: mapPoint(code.location.topLeftCorner),
+      topRightCorner: mapPoint(code.location.topRightCorner),
+      bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+      bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+    };
+
+    return {
+      data: code.data,
+      location: mappedLocation
+    };
   }
 
   function tick() {
     if (!running) return;
 
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      // カメラ解像度に合わせてキャンバスを毎フレーム更新（固定しない）
+      // カメラ解像度そのままにキャンバスを追従させる
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
@@ -242,30 +245,35 @@
 
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-      // ★ 複数領域で複数コードを探す
-      const codes = findCodesMultiRegion(imageData);
+      // ★ 今回のフレームでは「nextRegionIndex の領域だけ」探索する
+      const code = findOneCodeInRegion(imageData, nextRegionIndex);
 
-      if (codes.length > 0) {
-        // 1フレーム内で見つかった全コードに枠を描く＆新規なら結果に追加
-        for (const c of codes) {
-          const loc = c.location;
-          drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
-          drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
-          drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
-          drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
+      // 次のフレームでは次の領域を優先して見る（0→1→2→3→0…）
+      nextRegionIndex = (nextRegionIndex + 1) % 4;
 
-          addResult(c.data);
-        }
+      if (code) {
+        const loc = code.location;
+        drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
+        drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
+        drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
+        drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
 
-        // 一番最後に見つかったものだけ安定判定に使う（簡易）
-        const lastText = codes[codes.length - 1].data;
-        if (lastText === currentCandidate) {
+        const text = code.data;
+
+        // 安定判定（同じコードが連続で見えているか）
+        if (text === currentCandidate) {
           currentCandidateCount++;
         } else {
-          currentCandidate = lastText;
+          currentCandidate = text;
           currentCandidateCount = 1;
         }
+
+        // 「ある程度フレーム連続で見えた」と判断できたら追加
+        if (currentCandidateCount === STABLE_THRESHOLD) {
+          addResult(text);
+        }
       } else {
+        // 今回のフレームでは新しいコードは見つからなかった
         currentCandidate = null;
         currentCandidateCount = 0;
       }
