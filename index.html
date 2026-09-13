@@ -2,8 +2,11 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>QRコードリーダー</title>
+  <title>QRコードリーダー（複数対応）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- jsQR本体（ブラウザ用） -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 
   <style>
     :root {
@@ -55,6 +58,7 @@
       margin: 4px 0 0;
       font-size: 12px;
       color: #666;
+      line-height: 1.4;
     }
 
     .controls {
@@ -88,8 +92,8 @@
       color: #333;
     }
 
-    .btn-primary:disabled,
-    .btn-secondary:disabled {
+    .btn-secondary:disabled,
+    .btn-primary:disabled {
       opacity: 0.4;
       cursor: default;
     }
@@ -148,7 +152,6 @@
       width: 100%;
     }
 
-    /* キャンバスは中身のアスペクト比そのまま、高さはauto */
     #canvas {
       display: block;
       width: 100%;
@@ -255,7 +258,7 @@
   <div class="app">
     <header>
       <h1>QRコードリーダー</h1>
-      <p>カメラをオンにして、QRコードを中央に映してください。</p>
+      <p>カメラをオンにして、複数のQRコードを並べて映してください。</p>
       <div class="controls">
         <button id="startButton" class="btn-primary">カメラ開始</button>
         <button id="stopButton" class="btn-secondary" disabled>停止</button>
@@ -287,9 +290,7 @@
     </main>
   </div>
 
-  <!-- jsQRライブラリ（CDN） -->
-  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-
+  <!-- ここから下を、そのまま main.js に切り出してもOK（type="module" にする） -->
   <script>
     const video = document.createElement("video");
     const canvas = document.getElementById("canvas");
@@ -306,9 +307,8 @@
     const seenCodes = new Set();
     let resultCount = 0;
 
-    const STABLE_THRESHOLD = 3;
-    let currentCandidate = null;
-    let currentCandidateCount = 0;
+    const seedCodes = [];         // { data, rect: {x,y,w,h} }
+    const neighborQueue = [];     // { x, y, w, h }
 
     let stream = null;
     let running = false;
@@ -316,6 +316,34 @@
 
     function isUrlLike(text) {
       return /^https?:\/\/[^\s]+$/i.test(text.trim());
+    }
+
+    function distance(p1, p2) {
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function clampRect(rect, maxW, maxH) {
+      let { x, y, w, h } = rect;
+      if (w <= 0 || h <= 0) return null;
+
+      if (x < 0) {
+        w += x;
+        x = 0;
+      }
+      if (y < 0) {
+        h += y;
+        y = 0;
+      }
+      if (x + w > maxW) {
+        w = maxW - x;
+      }
+      if (y + h > maxH) {
+        h = maxH - y;
+      }
+      if (w <= 10 || h <= 10) return null;
+      return { x, y, w, h };
     }
 
     function enhanceSimple(imageData) {
@@ -342,7 +370,7 @@
       ctx.beginPath();
       ctx.moveTo(begin.x, begin.y);
       ctx.lineTo(end.x, end.y);
-      ctx.lineWidth = 4;
+      ctx.lineWidth = 3;
       ctx.strokeStyle = color;
       ctx.stroke();
     }
@@ -392,6 +420,193 @@
       resultsContainer.appendChild(item);
     }
 
+    function findOneCodeOnFullFrame(imageData) {
+      const { width, height, data } = imageData;
+
+      let code = jsQR(data, width, height, { inversionAttempts: "attemptBoth" });
+      if (code) return code;
+
+      const enhanced = enhanceSimple(
+        new ImageData(new Uint8ClampedArray(data), width, height)
+      );
+      code = jsQR(enhanced.data, width, height, { inversionAttempts: "attemptBoth" });
+      return code || null;
+    }
+
+    function findCodeInRect(imageData, rect) {
+      const { x, y, w, h } = rect;
+      const regionData = ctx.getImageData(x, y, w, h);
+
+      let code = jsQR(regionData.data, w, h, { inversionAttempts: "attemptBoth" });
+      if (!code) {
+        const enhanced = enhanceSimple(
+          new ImageData(new Uint8ClampedArray(regionData.data), w, h)
+        );
+        code = jsQR(enhanced.data, w, h, { inversionAttempts: "attemptBoth" });
+      }
+      if (!code) return null;
+
+      const text = code.data;
+      if (!text) return null;
+
+      function mapPoint(p) {
+        return { x: p.x + x, y: p.y + y };
+      }
+
+      return {
+        data: text,
+        location: {
+          topLeftCorner: mapPoint(code.location.topLeftCorner),
+          topRightCorner: mapPoint(code.location.topRightCorner),
+          bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+          bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+        }
+      };
+    }
+
+    function registerNewSeed(foundCode, canvasW, canvasH) {
+      const loc = foundCode.location;
+
+      const w = distance(loc.topLeftCorner, loc.topRightCorner);
+      const h = distance(loc.topLeftCorner, loc.bottomLeftCorner);
+      if (w <= 0 || h <= 0) return;
+
+      const cx = (loc.topLeftCorner.x + loc.bottomRightCorner.x) / 2;
+      const cy = (loc.topLeftCorner.y + loc.bottomRightCorner.y) / 2;
+
+      const padX = w * 0.4;
+      const padY = h * 0.4;
+
+      const selfRect = clampRect(
+        {
+          x: cx - w / 2 - padX,
+          y: cy - h / 2 - padY,
+          w: w + padX * 2,
+          h: h + padY * 2
+        },
+        canvasW,
+        canvasH
+      );
+      if (selfRect) neighborQueue.push(selfRect);
+
+      const leftRect = clampRect(
+        {
+          x: cx - (1.5 * w) - padX,
+          y: cy - h / 2 - padY,
+          w: w + padX * 2,
+          h: h + padY * 2
+        },
+        canvasW,
+        canvasH
+      );
+      if (leftRect) neighborQueue.push(leftRect);
+
+      const rightRect = clampRect(
+        {
+          x: cx + 0.5 * w - padX,
+          y: cy - h / 2 - padY,
+          w: w + padX * 2,
+          h: h + padY * 2
+        },
+        canvasW,
+        canvasH
+      );
+      if (rightRect) neighborQueue.push(rightRect);
+
+      const topRect = clampRect(
+        {
+          x: cx - w / 2 - padX,
+          y: cy - (1.5 * h) - padY,
+          w: w + padX * 2,
+          h: h + padY * 2
+        },
+        canvasW,
+        canvasH
+      );
+      if (topRect) neighborQueue.push(topRect);
+
+      const bottomRect = clampRect(
+        {
+          x: cx - w / 2 - padX,
+          y: cy + 0.5 * h - padY,
+          w: w + padX * 2,
+          h: h + padY * 2
+        },
+        canvasW,
+        canvasH
+      );
+      if (bottomRect) neighborQueue.push(bottomRect);
+
+      seedCodes.push({
+        data: foundCode.data,
+        rect: { x: cx - w / 2, y: cy - h / 2, w, h }
+      });
+
+      addResult(foundCode.data);
+    }
+
+    function tick() {
+      if (!running) return;
+
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        let foundInThisFrame = null;
+
+        if (seedCodes.length === 0) {
+          const code = findOneCodeOnFullFrame(imageData);
+          if (code && !seenCodes.has(code.data)) {
+            const mapped = {
+              data: code.data,
+              location: code.location
+            };
+            registerNewSeed(mapped, canvas.width, canvas.height);
+            foundInThisFrame = mapped;
+          }
+        } else {
+          const MAX_RECTS_PER_FRAME = 2;
+          for (let i = 0; i < MAX_RECTS_PER_FRAME; i++) {
+            const rect = neighborQueue.shift();
+            if (!rect) break;
+            const code = findCodeInRect(imageData, rect);
+            if (code && !seenCodes.has(code.data)) {
+              registerNewSeed(code, canvas.width, canvas.height);
+              foundInThisFrame = code;
+              break;
+            }
+          }
+
+          if (!foundInThisFrame && neighborQueue.length === 0) {
+            const code = findOneCodeOnFullFrame(imageData);
+            if (code && !seenCodes.has(code.data)) {
+              const mapped = {
+                data: code.data,
+                location: code.location
+              };
+              registerNewSeed(mapped, canvas.width, canvas.height);
+              foundInThisFrame = mapped;
+            }
+          }
+        }
+
+        if (foundInThisFrame) {
+          const loc = foundInThisFrame.location;
+          drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
+          drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
+          drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
+          drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
+        }
+      }
+
+      tickHandle = requestAnimationFrame(tick);
+    }
+
     async function startCamera() {
       if (running) return;
       try {
@@ -414,8 +629,11 @@
         stopButton.disabled = false;
 
         overlayText.classList.add("hidden");
-        statusText.textContent = "カメラ起動中。QRコードを中央に映してください。";
+        statusText.textContent = "カメラ起動中。複数のQRコードを順番に読み取ります。";
         canvas.hidden = false;
+
+        seedCodes.length = 0;
+        neighborQueue.length = 0;
 
         tickHandle = requestAnimationFrame(tick);
       } catch (err) {
@@ -448,62 +666,6 @@
 
       startButton.disabled = false;
       stopButton.disabled = true;
-    }
-
-    function tick() {
-      if (!running) return;
-
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        // ★ ここで毎フレーム、実際のカメラ解像度に合わせる（固定しない）
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-        let code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: "attemptBoth",
-        });
-
-        if (!code) {
-          const enhanced = enhanceSimple(
-            new ImageData(
-              new Uint8ClampedArray(imageData.data),
-              imageData.width,
-              imageData.height
-            )
-          );
-          code = jsQR(enhanced.data, enhanced.width, enhanced.height, {
-            inversionAttempts: "attemptBoth",
-          });
-        }
-
-        if (code) {
-          drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
-          drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
-          drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, "#FF3B58");
-          drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, "#FF3B58");
-
-          const text = code.data;
-          if (text === currentCandidate) {
-            currentCandidateCount++;
-          } else {
-            currentCandidate = text;
-            currentCandidateCount = 1;
-          }
-
-          if (currentCandidateCount === STABLE_THRESHOLD) {
-            addResult(text);
-          }
-        } else {
-          currentCandidate = null;
-          currentCandidateCount = 0;
-        }
-      }
-
-      tickHandle = requestAnimationFrame(tick);
     }
 
     startButton.addEventListener("click", startCamera);
