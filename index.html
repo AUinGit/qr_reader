@@ -143,20 +143,20 @@
       color: #666;
     }
 
+    /* 比率固定をやめて、幅だけ100%にする */
     .preview-wrapper {
       position: relative;
       border-radius: 12px;
       overflow: hidden;
       background: #000;
-      aspect-ratio: 3 / 4;
-      max-height: 60vh;
-      flex: 1;
+      width: 100%;
     }
 
+    /* キャンバスは中身のアスペクト比に従って高さが決まるようにする */
     #canvas {
-      width: 100%;
-      height: 100%;
       display: block;
+      width: 100%;
+      height: auto; /* ← これで縦横比を維持 */
       background: #000;
     }
 
@@ -466,8 +466,10 @@
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         displayCanvas.hidden = false;
 
+        // 内部のキャンバスサイズは動画のアスペクト比に合わせる
         displayCanvas.width = video.videoWidth;
         displayCanvas.height = video.videoHeight;
+
         displayCtx.imageSmoothingEnabled = true;
         displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
