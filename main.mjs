@@ -1,7 +1,6 @@
 // main.mjs
 
-// jsQR は index.html の <script src="...jsQR.min.js"> で読み込まれていて、
-// グローバル変数 jsQR として存在している前提。
+// jsQR は index.html の <script src="...jsQR.min.js"> で読み込まれている前提
 
 const video = document.createElement("video");
 const canvas = document.getElementById("canvas");
@@ -19,11 +18,6 @@ const stopButton = document.getElementById("stopButton");
 const seenCodes = new Set();
 let resultCount = 0;
 
-// 「種」となるQRコード（位置情報付き）
-const seedCodes = []; // { data, rect: {x,y,w,h} }
-// 「次に調べるべき近傍矩形」のキュー
-const neighborQueue = []; // { x, y, w, h }
-
 let stream = null;
 let running = false;
 let tickHandle = null;
@@ -34,37 +28,9 @@ function isUrlLike(text) {
   return /^https?:\/\/[^\s]+$/i.test(text.trim());
 }
 
-function distance(p1, p2) {
-  const dx = p1.x - p2.x;
-  const dy = p1.y - p2.y;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-function clampRect(rect, maxW, maxH) {
-  let { x, y, w, h } = rect;
-  if (w <= 0 || h <= 0) return null;
-
-  if (x < 0) {
-    w += x;
-    x = 0;
-  }
-  if (y < 0) {
-    h += y;
-    y = 0;
-  }
-  if (x + w > maxW) {
-    w = maxW - x;
-  }
-  if (y + h > maxH) {
-    h = maxH - y;
-  }
-  if (w <= 10 || h <= 10) return null;
-  return { x, y, w, h };
-}
-
 function enhanceSimple(imageData) {
   const data = imageData.data;
-  const contrast = 1.5;
+  const contrast = 1.4;
   const mid = 128;
 
   for (let i = 0; i < data.length; i += 4) {
@@ -140,132 +106,99 @@ function addResult(codeText) {
 
 // ========= 検出ロジック =========
 
-// フルフレームから「1個だけ」QRを探す
-function findOneCodeOnFullFrame(imageData) {
-  const { width, height, data } = imageData;
+/**
+ * 1フレームの imageData から、マスクしながら最大 maxCount 個までコードを読む
+ * 戻り値: [{ data, location }, ...]
+ */
+function detectMultipleCodes(imageData, maxCount = 8) {
+  const { width, height } = imageData;
+  const results = [];
 
-  let code = jsQR(data, width, height, { inversionAttempts: "attemptBoth" });
-  if (code) return code;
-
-  const enhanced = enhanceSimple(
-    new ImageData(new Uint8ClampedArray(data), width, height)
+  // 作業用コピー（元のimageDataはそのまま画面表示に使う）
+  let work = new ImageData(
+    new Uint8ClampedArray(imageData.data),
+    width,
+    height
   );
-  code = jsQR(enhanced.data, width, height, { inversionAttempts: "attemptBoth" });
-  return code || null;
-}
 
-// 任意の矩形 rect 内だけを対象に QR を探す
-function findCodeInRect(imageData, rect) {
-  const { x, y, w, h } = rect;
-  const regionData = ctx.getImageData(x, y, w, h);
+  for (let i = 0; i < maxCount; i++) {
+    // 1. 生画像でトライ
+    let code = jsQR(work.data, width, height, {
+      inversionAttempts: "attemptBoth",
+    });
 
-  let code = jsQR(regionData.data, w, h, { inversionAttempts: "attemptBoth" });
-  if (!code) {
-    const enhanced = enhanceSimple(
-      new ImageData(new Uint8ClampedArray(regionData.data), w, h)
-    );
-    code = jsQR(enhanced.data, w, h, { inversionAttempts: "attemptBoth" });
-  }
-  if (!code) return null;
-
-  const text = code.data;
-  if (!text) return null;
-
-  function mapPoint(p) {
-    return { x: p.x + x, y: p.y + y };
-  }
-
-  return {
-    data: text,
-    location: {
-      topLeftCorner: mapPoint(code.location.topLeftCorner),
-      topRightCorner: mapPoint(code.location.topRightCorner),
-      bottomRightCorner: mapPoint(code.location.bottomRightCorner),
-      bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+    // 2. ダメなら軽く強調して再トライ
+    if (!code) {
+      const enhanced = enhanceSimple(
+        new ImageData(
+          new Uint8ClampedArray(work.data),
+          width,
+          height
+        )
+      );
+      code = jsQR(enhanced.data, width, height, {
+        inversionAttempts: "attemptBoth",
+      });
     }
-  };
+
+    if (!code) {
+      break; // これ以上は見つからなさそう
+    }
+
+    if (!code.data || seenCodes.has(code.data)) {
+      // 既知のコード or 空文字 → この領域だけ塗って続行
+      maskCodeArea(work, code.location, width, height);
+      continue;
+    }
+
+    // 新規コード
+    results.push({
+      data: code.data,
+      location: code.location
+    });
+
+    // 次のループではこのコード領域を真っ白にして、他のコードを探す
+    maskCodeArea(work, code.location, width, height);
+  }
+
+  return results;
 }
 
-// 新しく見つかったQRを「種」として登録し、近傍矩形をキューへ追加
-function registerNewSeed(foundCode, canvasW, canvasH) {
-  const loc = foundCode.location;
+/**
+ * 検出されたQRコードの領域を、作業用イメージ work の上で白く塗りつぶす
+ * （次の jsQR ではこのコードを無視させるため）
+ */
+function maskCodeArea(work, location, imgW, imgH) {
+  // だいたいの外接矩形をとる
+  const xs = [
+    location.topLeftCorner.x,
+    location.topRightCorner.x,
+    location.bottomRightCorner.x,
+    location.bottomLeftCorner.x
+  ];
+  const ys = [
+    location.topLeftCorner.y,
+    location.topRightCorner.y,
+    location.bottomRightCorner.y,
+    location.bottomLeftCorner.y
+  ];
 
-  const w = distance(loc.topLeftCorner, loc.topRightCorner);
-  const h = distance(loc.topLeftCorner, loc.bottomLeftCorner);
-  if (w <= 0 || h <= 0) return;
+  let xMin = Math.max(0, Math.min(...xs) - 4);
+  let xMax = Math.min(imgW, Math.max(...xs) + 4);
+  let yMin = Math.max(0, Math.min(...ys) - 4);
+  let yMax = Math.min(imgH, Math.max(...ys) + 4);
 
-  const cx = (loc.topLeftCorner.x + loc.bottomRightCorner.x) / 2;
-  const cy = (loc.topLeftCorner.y + loc.bottomRightCorner.y) / 2;
+  const data = work.data;
 
-  const padX = w * 0.4;
-  const padY = h * 0.4;
-
-  const selfRect = clampRect(
-    {
-      x: cx - w / 2 - padX,
-      y: cy - h / 2 - padY,
-      w: w + padX * 2,
-      h: h + padY * 2
-    },
-    canvasW,
-    canvasH
-  );
-  if (selfRect) neighborQueue.push(selfRect);
-
-  const leftRect = clampRect(
-    {
-      x: cx - (1.5 * w) - padX,
-      y: cy - h / 2 - padY,
-      w: w + padX * 2,
-      h: h + padY * 2
-    },
-    canvasW,
-    canvasH
-  );
-  if (leftRect) neighborQueue.push(leftRect);
-
-  const rightRect = clampRect(
-    {
-      x: cx + 0.5 * w - padX,
-      y: cy - h / 2 - padY,
-      w: w + padX * 2,
-      h: h + padY * 2
-    },
-    canvasW,
-    canvasH
-  );
-  if (rightRect) neighborQueue.push(rightRect);
-
-  const topRect = clampRect(
-    {
-      x: cx - w / 2 - padX,
-      y: cy - (1.5 * h) - padY,
-      w: w + padX * 2,
-      h: h + padY * 2
-    },
-    canvasW,
-    canvasH
-  );
-  if (topRect) neighborQueue.push(topRect);
-
-  const bottomRect = clampRect(
-    {
-      x: cx - w / 2 - padX,
-      y: cy + 0.5 * h - padY,
-      w: w + padX * 2,
-      h: h + padY * 2
-    },
-    canvasW,
-    canvasH
-  );
-  if (bottomRect) neighborQueue.push(bottomRect);
-
-  seedCodes.push({
-    data: foundCode.data,
-    rect: { x: cx - w / 2, y: cy - h / 2, w, h }
-  });
-
-  addResult(foundCode.data);
+  for (let y = yMin; y < yMax; y++) {
+    for (let x = xMin; x < xMax; x++) {
+      const idx = (y * imgW + x) * 4;
+      data[idx] = 255;     // R
+      data[idx + 1] = 255; // G
+      data[idx + 2] = 255; // B
+      // alpha はそのまま or 255
+    }
+  }
 }
 
 // ========= メインループ =========
@@ -282,50 +215,17 @@ function tick() {
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    let foundInThisFrame = null;
+    // ★ このフレームでまとめて複数検出（上限はほどほどに）
+    const codes = detectMultipleCodes(imageData, 8);
 
-    if (seedCodes.length === 0) {
-      const code = findOneCodeOnFullFrame(imageData);
-      if (code && !seenCodes.has(code.data)) {
-        const mapped = {
-          data: code.data,
-          location: code.location
-        };
-        registerNewSeed(mapped, canvas.width, canvas.height);
-        foundInThisFrame = mapped;
-      }
-    } else {
-      const MAX_RECTS_PER_FRAME = 2;
-      for (let i = 0; i < MAX_RECTS_PER_FRAME; i++) {
-        const rect = neighborQueue.shift();
-        if (!rect) break;
-        const code = findCodeInRect(imageData, rect);
-        if (code && !seenCodes.has(code.data)) {
-          registerNewSeed(code, canvas.width, canvas.height);
-          foundInThisFrame = code;
-          break;
-        }
-      }
-
-      if (!foundInThisFrame && neighborQueue.length === 0) {
-        const code = findOneCodeOnFullFrame(imageData);
-        if (code && !seenCodes.has(code.data)) {
-          const mapped = {
-            data: code.data,
-            location: code.location
-          };
-          registerNewSeed(mapped, canvas.width, canvas.height);
-          foundInThisFrame = mapped;
-        }
-      }
-    }
-
-    if (foundInThisFrame) {
-      const loc = foundInThisFrame.location;
+    for (const c of codes) {
+      const loc = c.location;
       drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
       drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
       drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
       drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
+
+      addResult(c.data);
     }
   }
 
@@ -356,11 +256,8 @@ async function startCamera() {
     stopButton.disabled = false;
 
     overlayText.classList.add("hidden");
-    statusText.textContent = "カメラ起動中。複数のQRコードを順番に読み取ります。";
+    statusText.textContent = "カメラ起動中。複数のQRコードを同時に映しても順番に読み取ります。";
     canvas.hidden = false;
-
-    seedCodes.length = 0;
-    neighborQueue.length = 0;
 
     tickHandle = requestAnimationFrame(tick);
   } catch (err) {
@@ -394,6 +291,8 @@ function stopCamera() {
   startButton.disabled = false;
   stopButton.disabled = true;
 }
+
+// ========= イベント =========
 
 startButton.addEventListener("click", startCamera);
 stopButton.addEventListener("click", stopCamera);
