@@ -1,6 +1,7 @@
 // main.mjs
 
-// jsQR は index.html の <script src="...jsQR.min.js"> で読み込まれている前提
+// jsQR は index.html の <script src="...jsQR.min.js"> で読み込まれている前提。
+// ここではグローバル変数 jsQR を直接使う。
 
 const video = document.createElement("video");
 const canvas = document.getElementById("canvas");
@@ -22,13 +23,20 @@ let stream = null;
 let running = false;
 let tickHandle = null;
 
+// 解析用オフスクリーンキャンバス（スケールごとに使い回す）
+const offscreen = document.createElement("canvas");
+const offctx = offscreen.getContext("2d", { willReadFrequently: true });
+
+// このフレーム内で二重登録しないためのセット
+let seenThisFrame = new Set();
+
 // ========= ユーティリティ =========
 
 function isUrlLike(text) {
   return /^https?:\/\/[^\s]+$/i.test(text.trim());
 }
 
-// 軽量グレースケール＋コントラスト強調（小さいQR向け）
+// 軽量グレースケール＋コントラスト強調（汎用用）
 function enhanceSimple(imageData) {
   const data = imageData.data;
   const contrast = 1.4;
@@ -53,7 +61,7 @@ function drawLine(begin, end, color) {
   ctx.beginPath();
   ctx.moveTo(begin.x, begin.y);
   ctx.lineTo(end.x, end.y);
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 3;
   ctx.strokeStyle = color;
   ctx.stroke();
 }
@@ -94,89 +102,150 @@ function addResult(codeText) {
   resultsContainer.appendChild(item);
 }
 
-// ========= 6×6 固定グリッド検出 =========
+// ========= マスクしながら複数検出（スケール付き） =========
 
 /**
- * 1フレームを 6×6 に固定分割し、それぞれのセルについて
- * jsQR をかけて読めたQRを返す。
- *
- * 戻り値: [{ data, location }, ...]
+ * workImageData 上で、QRコードを見つけてはその領域を白塗りしつつ、
+ * 最大 maxPerScale 個まで繰り返し検出する。
+ * scale は「この workImageData が元画像の何倍／何分の1か」。
+ * 戻り値: [{ data, location }, ...] location は元キャンバス座標系。
  */
-function detectGridCodes(imageData) {
-  const { width, height } = imageData;
-
-  const COLS = 6;
-  const ROWS = 6;
-
-  const cellW = width / COLS;
-  const cellH = height / ROWS;
-
+function detectOnSingleScale(workImageData, scale, maxPerScale, fullWidth, fullHeight) {
   const results = [];
-  const alreadySeenThisFrame = new Set();
+  const w = workImageData.width;
+  const h = workImageData.height;
 
-  // セルごとに左上→右下へ順番に試す
-  for (let row = 0; row < ROWS; row++) {
-    for (let col = 0; col < COLS; col++) {
-      const x0 = Math.floor(col * cellW);
-      const y0 = Math.floor(row * cellH);
-      const x1 = Math.floor((col + 1) * cellW);
-      const y1 = Math.floor((row + 1) * cellH);
+  // 作業コピー（ここで書き換えてマスクしていく）
+  let work = new ImageData(
+    new Uint8ClampedArray(workImageData.data),
+    w,
+    h
+  );
 
-      // 少し内側を切り出す（セル境界付近のノイズを避ける）
-      const marginX = Math.floor((x1 - x0) * 0.1);
-      const marginY = Math.floor((y1 - y0) * 0.1);
+  for (let i = 0; i < maxPerScale; i++) {
+    let code = jsQR(work.data, w, h, {
+      inversionAttempts: "attemptBoth",
+    });
 
-      const x = x0 + marginX;
-      const y = y0 + marginY;
-      const w = Math.max(8, (x1 - x0) - marginX * 2);
-      const h = Math.max(8, (y1 - y0) - marginY * 2);
-
-      if (w <= 0 || h <= 0) continue;
-
-      const regionData = ctx.getImageData(x, y, w, h);
-
-      // 1回目：生画像
-      let code = jsQR(regionData.data, w, h, {
+    if (!code) {
+      const enhanced = enhanceSimple(
+        new ImageData(
+          new Uint8ClampedArray(work.data),
+          w,
+          h
+        )
+      );
+      code = jsQR(enhanced.data, w, h, {
         inversionAttempts: "attemptBoth",
       });
+    }
 
-      // 2回目：軽く強調
-      if (!code) {
-        const enhanced = enhanceSimple(
-          new ImageData(
-            new Uint8ClampedArray(regionData.data),
-            w,
-            h
-          )
-        );
-        code = jsQR(enhanced.data, w, h, {
-          inversionAttempts: "attemptBoth",
-        });
-      }
+    if (!code || !code.data) break;
 
-      if (!code || !code.data) continue;
+    const text = code.data;
+    if (seenThisFrame.has(text)) {
+      // このフレーム内でも既に扱ったコードなら、領域だけ塗って続行
+      maskLocation(work, code.location, w, h);
+      continue;
+    }
+    seenThisFrame.add(text);
 
-      const text = code.data;
+    // スケールを元にフル解像度座標へ変換
+    function mapPoint(p) {
+      return {
+        x: Math.min(fullWidth,  Math.max(0, p.x / scale)),
+        y: Math.min(fullHeight, Math.max(0, p.y / scale)),
+      };
+    }
 
-      // このフレーム内で重複していたらスキップ
-      if (alreadySeenThisFrame.has(text)) continue;
-      alreadySeenThisFrame.add(text);
+    const mappedLoc = {
+      topLeftCorner:     mapPoint(code.location.topLeftCorner),
+      topRightCorner:    mapPoint(code.location.topRightCorner),
+      bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+      bottomLeftCorner:  mapPoint(code.location.bottomLeftCorner),
+    };
 
-      // 領域内座標 → フルキャンバス座標に変換
-      function mapPoint(p) {
-        return { x: p.x + x, y: p.y + y };
-      }
+    results.push({
+      data: text,
+      location: mappedLoc,
+    });
 
-      results.push({
-        data: text,
-        location: {
-          topLeftCorner: mapPoint(code.location.topLeftCorner),
-          topRightCorner: mapPoint(code.location.topRightCorner),
-          bottomRightCorner: mapPoint(code.location.bottomRightCorner),
-          bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
-        },
-        cell: { row, col }
-      });
+    // 次のコードを探すために、今見つけた領域を白塗り
+    maskLocation(work, code.location, w, h);
+  }
+
+  return results;
+}
+
+/**
+ * jsQR の location 情報を元に、その周辺領域を workImageData 上で白塗りする。
+ */
+function maskLocation(workImageData, location, imgW, imgH) {
+  const xs = [
+    location.topLeftCorner.x,
+    location.topRightCorner.x,
+    location.bottomRightCorner.x,
+    location.bottomLeftCorner.x
+  ];
+  const ys = [
+    location.topLeftCorner.y,
+    location.topRightCorner.y,
+    location.bottomRightCorner.y,
+    location.bottomLeftCorner.y
+  ];
+
+  let xMin = Math.max(0, Math.floor(Math.min(...xs) - 3));
+  let xMax = Math.min(imgW, Math.ceil(Math.max(...xs) + 3));
+  let yMin = Math.max(0, Math.floor(Math.min(...ys) - 3));
+  let yMax = Math.min(imgH, Math.ceil(Math.max(...ys) + 3));
+
+  const data = workImageData.data;
+
+  for (let y = yMin; y < yMax; y++) {
+    for (let x = xMin; x < xMax; x++) {
+      const idx = (y * imgW + x) * 4;
+      data[idx]     = 255; // R
+      data[idx + 1] = 255; // G
+      data[idx + 2] = 255; // B
+      // alpha はそのまま
+    }
+  }
+}
+
+/**
+ * 1フレームについて、複数スケールでマスク付き検出を行う。
+ * 戻り値: [{ data, location }, ...] （location はフルキャンバス座標）
+ */
+function detectMultiScale(imageData, fullWidth, fullHeight) {
+  const results = [];
+
+  // 解析スケールの候補：元サイズ、0.75倍、0.5倍
+  const scales = [1.0, 0.75, 0.5];
+  const MAX_PER_SCALE = 4; // 1スケールあたりの上限
+
+  for (const scale of scales) {
+    const sw = Math.floor(fullWidth * scale);
+    const sh = Math.floor(fullHeight * scale);
+
+    if (sw < 40 || sh < 40) continue; // 小さすぎると意味がない
+
+    offscreen.width = sw;
+    offscreen.height = sh;
+    offctx.imageSmoothingEnabled = false;
+    offctx.drawImage(canvas, 0, 0, sw, sh);
+
+    const scaledImageData = offctx.getImageData(0, 0, sw, sh);
+
+    const found = detectOnSingleScale(
+      scaledImageData,
+      scale,
+      MAX_PER_SCALE,
+      fullWidth,
+      fullHeight
+    );
+
+    if (found.length > 0) {
+      results.push(...found);
     }
   }
 
@@ -197,12 +266,13 @@ function tick() {
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    // ★ このフレームで 6×6 グリッド全セルを走査
-    const codes = detectGridCodes(imageData);
+    // このフレームで見つけたコードの重複制御用セットをリセット
+    seenThisFrame = new Set();
+
+    const codes = detectMultiScale(imageData, canvas.width, canvas.height);
 
     for (const c of codes) {
       const loc = c.location;
-
       drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
       drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
       drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
@@ -239,7 +309,8 @@ async function startCamera() {
     stopButton.disabled = false;
 
     overlayText.classList.add("hidden");
-    statusText.textContent = "カメラ起動中。6×6のQR表を画面いっぱいになるくらいに映してください。";
+    statusText.textContent =
+      "カメラ起動中。複数QRを画面中央〜全体に映してみてください（大きめ推奨）。";
     canvas.hidden = false;
 
     tickHandle = requestAnimationFrame(tick);
@@ -274,6 +345,8 @@ function stopCamera() {
   startButton.disabled = false;
   stopButton.disabled = true;
 }
+
+// ========= イベント =========
 
 startButton.addEventListener("click", startCamera);
 stopButton.addEventListener("click", stopCamera);
