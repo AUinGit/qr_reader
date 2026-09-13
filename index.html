@@ -11,7 +11,6 @@
       --bg: #f5f5f7;
       --fg: #111;
       --accent: #007aff;
-      --danger: #ff3b30;
       --card: #ffffff;
       --border: #d0d0d5;
     }
@@ -104,7 +103,7 @@
       gap: 12px;
     }
 
-    /* PC向け: カメラと結果を横並びにする */
+    /* PC: カメラと結果を横並び */
     @media (min-width: 768px) {
       main {
         flex-direction: row;
@@ -143,7 +142,6 @@
       color: #666;
     }
 
-    /* 比率固定をやめて、幅だけ100%にする */
     .preview-wrapper {
       position: relative;
       border-radius: 12px;
@@ -152,11 +150,11 @@
       width: 100%;
     }
 
-    /* キャンバスは中身のアスペクト比に従って高さが決まるようにする */
+    /* 内部的には 640x480 で描画して、CSS で横幅だけ伸ばす */
     #canvas {
       display: block;
       width: 100%;
-      height: auto; /* ← これで縦横比を維持 */
+      height: auto;
       background: #000;
     }
 
@@ -296,8 +294,9 @@
 
   <script>
     const video = document.createElement("video");
-    const displayCanvas = document.getElementById("canvas");
-    const displayCtx = displayCanvas.getContext("2d");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
     const statusText = document.getElementById("statusText");
     const overlayText = document.getElementById("overlayText");
     const outputContainer = document.getElementById("output");
@@ -305,11 +304,6 @@
     const countTag = document.getElementById("countTag");
     const startButton = document.getElementById("startButton");
     const stopButton = document.getElementById("stopButton");
-
-    const scanCanvas = document.createElement("canvas");
-    const scanCtx = scanCanvas.getContext("2d", { willReadFrequently: true });
-    const SCAN_WIDTH = 640;
-    const SCAN_HEIGHT = 360;
 
     const seenCodes = new Set();
     let resultCount = 0;
@@ -321,7 +315,6 @@
     let stream = null;
     let running = false;
     let tickHandle = null;
-    let frameCounter = 0;
 
     function isUrlLike(text) {
       return /^https?:\/\/[^\s]+$/i.test(text.trim());
@@ -348,12 +341,12 @@
     }
 
     function drawLine(begin, end, color) {
-      displayCtx.beginPath();
-      displayCtx.moveTo(begin.x, begin.y);
-      displayCtx.lineTo(end.x, end.y);
-      displayCtx.lineWidth = 4;
-      displayCtx.strokeStyle = color;
-      displayCtx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(begin.x, begin.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = color;
+      ctx.stroke();
     }
 
     function addResult(codeText) {
@@ -410,7 +403,7 @@
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
-            width:  { ideal: 1280 },
+            width: { ideal: 1280 },
             height: { ideal: 720 },
             frameRate: { ideal: 30, max: 60 }
           }
@@ -426,6 +419,11 @@
 
         overlayText.classList.add("hidden");
         statusText.textContent = "カメラ起動中。QRコードを中央に映してください。";
+
+        // 内部解像度は固定 640x480（ここで決め打ち）
+        canvas.width = 640;
+        canvas.height = 480;
+        canvas.hidden = false;
 
         tickHandle = requestAnimationFrame(tick);
       } catch (err) {
@@ -451,7 +449,7 @@
 
       video.srcObject = null;
 
-      displayCanvas.hidden = true;
+      canvas.hidden = true;
       overlayText.classList.remove("hidden");
       overlayText.textContent = "カメラオフ";
       statusText.textContent = "カメラは停止中です。「カメラ開始」をタップしてください。";
@@ -464,64 +462,34 @@
       if (!running) return;
 
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        displayCanvas.hidden = false;
+        // 動画フレームを 640x480 に縮小して描画
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        // 内部のキャンバスサイズは動画のアスペクト比に合わせる
-        displayCanvas.width = video.videoWidth;
-        displayCanvas.height = video.videoHeight;
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-        displayCtx.imageSmoothingEnabled = true;
-        displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
-
-        frameCounter++;
-        if (frameCounter % 2 === 0) {
-          tickHandle = requestAnimationFrame(tick);
-          return;
-        }
-
-        scanCanvas.width = SCAN_WIDTH;
-        scanCanvas.height = SCAN_HEIGHT;
-        scanCtx.imageSmoothingEnabled = false;
-        scanCtx.drawImage(video, 0, 0, SCAN_WIDTH, SCAN_HEIGHT);
-
-        const scanImageData = scanCtx.getImageData(0, 0, SCAN_WIDTH, SCAN_HEIGHT);
-
-        let code = jsQR(scanImageData.data, SCAN_WIDTH, SCAN_HEIGHT, {
+        let code = jsQR(imageData.data, canvas.width, canvas.height, {
           inversionAttempts: "attemptBoth",
         });
 
         if (!code) {
           const enhanced = enhanceSimple(
             new ImageData(
-              new Uint8ClampedArray(scanImageData.data),
-              SCAN_WIDTH,
-              SCAN_HEIGHT
+              new Uint8ClampedArray(imageData.data),
+              canvas.width,
+              canvas.height
             )
           );
-          code = jsQR(enhanced.data, SCAN_WIDTH, SCAN_HEIGHT, {
+          code = jsQR(enhanced.data, canvas.width, canvas.height, {
             inversionAttempts: "attemptBoth",
           });
         }
 
         if (code) {
-          const scaleX = displayCanvas.width / SCAN_WIDTH;
-          const scaleY = displayCanvas.height / SCAN_HEIGHT;
-
-          function mapPoint(p) {
-            return { x: p.x * scaleX, y: p.y * scaleY };
-          }
-
-          const loc = {
-            topLeftCorner: mapPoint(code.location.topLeftCorner),
-            topRightCorner: mapPoint(code.location.topRightCorner),
-            bottomRightCorner: mapPoint(code.location.bottomRightCorner),
-            bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
-          };
-
-          drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
-          drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
-          drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
-          drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
+          drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
+          drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
+          drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, "#FF3B58");
+          drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, "#FF3B58");
 
           const text = code.data;
           if (text === currentCandidate) {
