@@ -1,107 +1,294 @@
-<!-- qr-camera.html -->
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <title>QRコードリーダー（カメラ）</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8" />
+  <title>QRコードリーダー</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
-      color: #333;
-      max-width: 640px;
-      margin: 0 auto;
-      padding: 10px;
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f5f7;
+      --fg: #111;
+      --accent: #007aff;
+      --danger: #ff3b30;
+      --card: #ffffff;
+      --border: #d0d0d5;
+    }
+
+    * {
       box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
     }
 
-    h1 {
-      font-size: 22px;
-      margin: 10px 0;
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
     }
 
-    #controls {
-      margin-bottom: 10px;
+    .app {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      max-width: 1200px;
+      margin: 0 auto;
     }
 
-    #controls button {
-      padding: 6px 12px;
-      margin-right: 8px;
+    header {
+      padding: 12px 16px 8px;
+      border-bottom: 1px solid var(--border);
+      background: var(--card);
+      position: sticky;
+      top: 0;
+      z-index: 10;
     }
 
-    #loadingMessage {
-      text-align: center;
-      padding: 20px;
-      background-color: #eee;
-      border-radius: 8px;
-      margin-bottom: 10px;
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
     }
 
-    /* 表示用キャンバス（見た目用） */
+    header p {
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: #666;
+      line-height: 1.4;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .controls button {
+      flex: 1;
+      padding: 10px 0;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      transition: opacity 0.15s ease, transform 0.05s ease;
+    }
+
+    .controls button:active {
+      transform: scale(0.97);
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-secondary {
+      background: #e5e5ea;
+      color: #333;
+    }
+
+    .btn-secondary:disabled,
+    .btn-primary:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    main {
+      flex: 1;
+      padding: 10px 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* PC向け: カメラと結果を横並びにする */
+    @media (min-width: 768px) {
+      main {
+        flex-direction: row;
+        align-items: stretch;
+      }
+
+      .main-column {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .main-column.results {
+        max-width: 420px;
+      }
+    }
+
+    @media (max-width: 767px) {
+      .main-column {
+        width: 100%;
+      }
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+      padding: 10px 10px 12px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .status {
+      font-size: 13px;
+      color: #666;
+    }
+
+    .preview-wrapper {
+      position: relative;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 3 / 4;
+      max-height: 60vh;
+      flex: 1;
+    }
+
     #canvas {
       width: 100%;
-      border-radius: 8px;
+      height: 100%;
+      display: block;
       background: #000;
     }
 
-    #output {
-      margin-top: 16px;
-      background: #eee;
-      padding: 10px;
-      border-radius: 8px;
+    .preview-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      color: #fff;
+      font-size: 13px;
+      text-shadow: 0 0 8px rgba(0,0,0,0.8);
+      background: rgba(0,0,0,0.2);
     }
 
-    #output div {
-      padding-bottom: 6px;
-      word-wrap: break-word;
+    .preview-overlay.hidden {
+      opacity: 0;
+      background: transparent;
+    }
+
+    .results-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .results-header span {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .tag-count {
+      font-size: 11px;
+      background: #eee;
+      padding: 2px 6px;
+      border-radius: 999px;
+      color: #666;
+    }
+
+    .results-list {
+      flex: 1;
+      overflow-y: auto;
+      padding-right: 4px;
+      max-height: 40vh;
+    }
+
+    @media (min-width: 768px) {
+      .results-list {
+        max-height: none;
+      }
     }
 
     .result-item {
-      font-family: monospace;
-      white-space: pre-wrap;
-      padding: 4px 6px;
-      margin-bottom: 4px;
-      background: #fff;
-      border-radius: 4px;
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
     }
 
-    .result-item-index {
-      font-weight: bold;
-      margin-right: 4px;
+    .result-item:last-child {
+      border-bottom: none;
     }
 
-    .result-link {
-      color: #0066cc;
+    .result-meta {
+      font-size: 11px;
+      color: #999;
+      display: flex;
+      gap: 4px;
+      align-items: center;
+    }
+
+    .result-index {
+      font-weight: 600;
+    }
+
+    .result-type {
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: #e5f2ff;
+      color: #0070c9;
+    }
+
+    .result-text a {
+      color: #007aff;
       text-decoration: underline;
       word-break: break-all;
+    }
+
+    .result-text {
+      word-break: break-word;
+      line-height: 1.3;
     }
   </style>
 </head>
 
 <body>
-  <h1>QRコードリーダー（カメラ）</h1>
+  <div class="app">
+    <header>
+      <h1>QRコードリーダー</h1>
+      <p>カメラをオンにして、QRコードを中央に映してください。</p>
+      <div class="controls">
+        <button id="startButton" class="btn-primary">カメラ開始</button>
+        <button id="stopButton" class="btn-secondary" disabled>停止</button>
+      </div>
+    </header>
 
-  <div id="controls">
-    <button id="startButton">カメラ開始</button>
-    <button id="stopButton" disabled>カメラ停止</button>
-  </div>
+    <main>
+      <section class="main-column card">
+        <div class="status" id="statusText">
+          カメラは停止中です。「カメラ開始」をタップしてください。
+        </div>
+        <div class="preview-wrapper">
+          <canvas id="canvas" hidden></canvas>
+          <div class="preview-overlay" id="overlayText">
+            カメラオフ
+          </div>
+        </div>
+      </section>
 
-  <p>
-    カメラを開始して、画面にQRコードを映してください。<br>
-    読み取られたQRコードは下のリストに<strong>一度だけ</strong>追加されます。<br>
-    URL形式のものはクリック可能なリンクになります。
-  </p>
-
-  <div id="loadingMessage">
-    カメラは停止中です。「カメラ開始」ボタンを押してください。
-  </div>
-
-  <canvas id="canvas" hidden></canvas>
-
-  <div id="output" hidden>
-    <div id="outputMessage">まだQRコードは検出されていません。</div>
-    <div id="resultsContainer"></div>
+      <section class="main-column results card">
+        <div class="results-header">
+          <span>検出されたQRコード</span>
+          <span class="tag-count" id="countTag">0件</span>
+        </div>
+        <div id="output" hidden>
+          <div id="resultsContainer" class="results-list"></div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <!-- jsQRライブラリ（CDN） -->
@@ -109,16 +296,16 @@
 
   <script>
     const video = document.createElement("video");
-    const displayCanvas = document.getElementById("canvas");       // 表示用
+    const displayCanvas = document.getElementById("canvas");
     const displayCtx = displayCanvas.getContext("2d");
-    const loadingMessage = document.getElementById("loadingMessage");
+    const statusText = document.getElementById("statusText");
+    const overlayText = document.getElementById("overlayText");
     const outputContainer = document.getElementById("output");
-    const outputMessage = document.getElementById("outputMessage");
     const resultsContainer = document.getElementById("resultsContainer");
+    const countTag = document.getElementById("countTag");
     const startButton = document.getElementById("startButton");
     const stopButton = document.getElementById("stopButton");
 
-    // 解析用の小さいキャンバス（ユーザーには見せない）
     const scanCanvas = document.createElement("canvas");
     const scanCtx = scanCanvas.getContext("2d", { willReadFrequently: true });
     const SCAN_WIDTH = 640;
@@ -134,60 +321,12 @@
     let stream = null;
     let running = false;
     let tickHandle = null;
-    let frameCounter = 0; // フレーム間引き用
-
-    function drawLine(begin, end, color) {
-      displayCtx.beginPath();
-      displayCtx.moveTo(begin.x, begin.y);
-      displayCtx.lineTo(end.x, end.y);
-      displayCtx.lineWidth = 4;
-      displayCtx.strokeStyle = color;
-      displayCtx.stroke();
-    }
+    let frameCounter = 0;
 
     function isUrlLike(text) {
       return /^https?:\/\/[^\s]+$/i.test(text.trim());
     }
 
-    function addResult(codeText) {
-      if (seenCodes.has(codeText)) return;
-
-      seenCodes.add(codeText);
-      resultCount++;
-
-      if (resultCount === 1) {
-        outputMessage.textContent = "検出されたQRコード一覧：";
-      }
-
-      const div = document.createElement("div");
-      div.className = "result-item";
-
-      const indexSpan = document.createElement("span");
-      indexSpan.className = "result-item-index";
-      indexSpan.textContent = "[" + resultCount + "]";
-
-      const contentSpan = document.createElement("span");
-      const trimmed = codeText.trim();
-
-      if (isUrlLike(trimmed)) {
-        const a = document.createElement("a");
-        a.href = trimmed;
-        a.textContent = trimmed;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.className = "result-link";
-        contentSpan.appendChild(document.createTextNode(" "));
-        contentSpan.appendChild(a);
-      } else {
-        contentSpan.textContent = " " + codeText;
-      }
-
-      div.appendChild(indexSpan);
-      div.appendChild(contentSpan);
-      resultsContainer.appendChild(div);
-    }
-
-    // 軽量なグレースケール＋コントラスト
     function enhanceSimple(imageData) {
       const data = imageData.data;
       const contrast = 1.5;
@@ -208,10 +347,66 @@
       return imageData;
     }
 
+    function drawLine(begin, end, color) {
+      displayCtx.beginPath();
+      displayCtx.moveTo(begin.x, begin.y);
+      displayCtx.lineTo(end.x, end.y);
+      displayCtx.lineWidth = 4;
+      displayCtx.strokeStyle = color;
+      displayCtx.stroke();
+    }
+
+    function addResult(codeText) {
+      if (seenCodes.has(codeText)) return;
+
+      seenCodes.add(codeText);
+      resultCount++;
+      countTag.textContent = resultCount + "件";
+      outputContainer.hidden = false;
+
+      const item = document.createElement("div");
+      item.className = "result-item";
+
+      const meta = document.createElement("div");
+      meta.className = "result-meta";
+
+      const idx = document.createElement("span");
+      idx.className = "result-index";
+      idx.textContent = "#" + resultCount;
+
+      const type = document.createElement("span");
+      type.className = "result-type";
+      type.textContent = isUrlLike(codeText) ? "URL" : "テキスト";
+
+      meta.appendChild(idx);
+      meta.appendChild(type);
+
+      const textEl = document.createElement("div");
+      textEl.className = "result-text";
+
+      const trimmed = codeText.trim();
+      if (isUrlLike(trimmed)) {
+        const a = document.createElement("a");
+        a.href = trimmed;
+        a.textContent = trimmed;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        textEl.appendChild(a);
+      } else {
+        textEl.textContent = codeText;
+      }
+
+      item.appendChild(meta);
+      item.appendChild(textEl);
+      resultsContainer.appendChild(item);
+    }
+
     async function startCamera() {
       if (running) return;
       try {
-        loadingMessage.innerText = "カメラを起動中です...";
+        statusText.textContent = "カメラを起動中です...";
+        overlayText.textContent = "起動中...";
+
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
@@ -229,9 +424,13 @@
         startButton.disabled = true;
         stopButton.disabled = false;
 
+        overlayText.classList.add("hidden");
+        statusText.textContent = "カメラ起動中。QRコードを中央に映してください。";
+
         tickHandle = requestAnimationFrame(tick);
       } catch (err) {
-        loadingMessage.innerText = "カメラにアクセスできません: " + err.message;
+        statusText.textContent = "カメラにアクセスできません: " + err.message;
+        overlayText.textContent = "エラー";
       }
     }
 
@@ -252,9 +451,10 @@
 
       video.srcObject = null;
 
-      loadingMessage.innerText = "カメラは停止中です。「カメラ開始」ボタンを押してください。";
       displayCanvas.hidden = true;
-      outputContainer.hidden = false;
+      overlayText.classList.remove("hidden");
+      overlayText.textContent = "カメラオフ";
+      statusText.textContent = "カメラは停止中です。「カメラ開始」をタップしてください。";
 
       startButton.disabled = false;
       stopButton.disabled = true;
@@ -263,28 +463,20 @@
     function tick() {
       if (!running) return;
 
-      loadingMessage.innerText = "Loading video...";
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        loadingMessage.hidden = false; // メッセージ自体は表示したままでもOK
         displayCanvas.hidden = false;
-        outputContainer.hidden = false;
 
-        // 表示キャンバスのサイズを動画に合わせる（見た目用）
         displayCanvas.width = video.videoWidth;
         displayCanvas.height = video.videoHeight;
         displayCtx.imageSmoothingEnabled = true;
-
-        // 動画フレームをそのまま表示キャンバスに描画
         displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
-        // フレーム間引き：2フレームに1回だけ解析
         frameCounter++;
         if (frameCounter % 2 === 0) {
           tickHandle = requestAnimationFrame(tick);
           return;
         }
 
-        // 解析用の小さいキャンバスに縮小描画（オリジナル→SCAN_WIDTH×SCAN_HEIGHT）
         scanCanvas.width = SCAN_WIDTH;
         scanCanvas.height = SCAN_HEIGHT;
         scanCtx.imageSmoothingEnabled = false;
@@ -292,14 +484,10 @@
 
         const scanImageData = scanCtx.getImageData(0, 0, SCAN_WIDTH, SCAN_HEIGHT);
 
-        let code = null;
-
-        // 1. 生画像で解析
-        code = jsQR(scanImageData.data, SCAN_WIDTH, SCAN_HEIGHT, {
+        let code = jsQR(scanImageData.data, SCAN_WIDTH, SCAN_HEIGHT, {
           inversionAttempts: "attemptBoth",
         });
 
-        // 2. まだ見つからなければ簡易強調して再解析
         if (!code) {
           const enhanced = enhanceSimple(
             new ImageData(
@@ -314,15 +502,11 @@
         }
 
         if (code) {
-          // 解析キャンバス座標 → 表示キャンバス座標にスケールして枠線を描く
           const scaleX = displayCanvas.width / SCAN_WIDTH;
           const scaleY = displayCanvas.height / SCAN_HEIGHT;
 
           function mapPoint(p) {
-            return {
-              x: p.x * scaleX,
-              y: p.y * scaleY,
-            };
+            return { x: p.x * scaleX, y: p.y * scaleY };
           }
 
           const loc = {
@@ -338,7 +522,6 @@
           drawLine(loc.bottomLeftCorner, loc.topLeftCorner, "#FF3B58");
 
           const text = code.data;
-
           if (text === currentCandidate) {
             currentCandidateCount++;
           } else {
