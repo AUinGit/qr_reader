@@ -1,7 +1,6 @@
 // main.mjs
 
-// jsQR は index.html の <script src="...jsQR.min.js"> で読み込まれている前提。
-// ここではグローバル変数 jsQR を直接使う。
+// 前提: index.html 側で jsQR をCDNから読み込んでいて、グローバルに jsQR がいる
 
 const video = document.createElement("video");
 const canvas = document.getElementById("canvas");
@@ -15,15 +14,16 @@ const countTag = document.getElementById("countTag");
 const startButton = document.getElementById("startButton");
 const stopButton = document.getElementById("stopButton");
 
-// すでにリストに追加したQR文字列
+// すでに結果リストに追加したQR文字列（重複防止）
 const seenCodes = new Set();
 let resultCount = 0;
 
+// カメラ＆ループ制御
 let stream = null;
 let running = false;
 let tickHandle = null;
 
-// 解析用オフスクリーンキャンバス（スケールごとに使い回す）
+// 解析用オフスクリーンキャンバス（スケールごとに使い回し）
 const offscreen = document.createElement("canvas");
 const offctx = offscreen.getContext("2d", { willReadFrequently: true });
 
@@ -36,7 +36,7 @@ function isUrlLike(text) {
   return /^https?:\/\/[^\s]+$/i.test(text.trim());
 }
 
-// 軽量グレースケール＋コントラスト強調（汎用用）
+// 軽量グレースケール＋コントラスト強調
 function enhanceSimple(imageData) {
   const data = imageData.data;
   const contrast = 1.4;
@@ -105,7 +105,7 @@ function addResult(codeText) {
 // ========= マスクしながら複数検出（スケール付き） =========
 
 /**
- * workImageData 上で、QRコードを見つけてはその領域を白塗りしつつ、
+ * workImageData 上で、QRコードを順に見つけてはその領域を白塗りしつつ、
  * 最大 maxPerScale 個まで繰り返し検出する。
  * scale は「この workImageData が元画像の何倍／何分の1か」。
  * 戻り値: [{ data, location }, ...] location は元キャンバス座標系。
@@ -143,8 +143,9 @@ function detectOnSingleScale(workImageData, scale, maxPerScale, fullWidth, fullH
     if (!code || !code.data) break;
 
     const text = code.data;
+
+    // このフレーム内で既に扱ったコードなら、領域だけ塗って続行
     if (seenThisFrame.has(text)) {
-      // このフレーム内でも既に扱ったコードなら、領域だけ塗って続行
       maskLocation(work, code.location, w, h);
       continue;
     }
@@ -179,6 +180,7 @@ function detectOnSingleScale(workImageData, scale, maxPerScale, fullWidth, fullH
 
 /**
  * jsQR の location 情報を元に、その周辺領域を workImageData 上で白塗りする。
+ * マスク範囲はやや細めにして、隣接QRへのダメージを減らす。
  */
 function maskLocation(workImageData, location, imgW, imgH) {
   const xs = [
@@ -194,10 +196,20 @@ function maskLocation(workImageData, location, imgW, imgH) {
     location.bottomLeftCorner.y
   ];
 
-  let xMin = Math.max(0, Math.floor(Math.min(...xs) - 3));
-  let xMax = Math.min(imgW, Math.ceil(Math.max(...xs) + 3));
-  let yMin = Math.max(0, Math.floor(Math.min(...ys) - 3));
-  let yMax = Math.min(imgH, Math.ceil(Math.max(...ys) + 3));
+  const margin = 2;
+
+  let xMin = Math.max(0, Math.floor(Math.min(...xs) + margin));
+  let xMax = Math.min(imgW, Math.ceil(Math.max(...xs) - margin));
+  let yMin = Math.max(0, Math.floor(Math.min(...ys) + margin));
+  let yMax = Math.min(imgH, Math.ceil(Math.max(...ys) - margin));
+
+  // 変に潰れた場合は元の外接矩形に戻す
+  if (xMax <= xMin || yMax <= yMin) {
+    xMin = Math.max(0, Math.floor(Math.min(...xs)));
+    xMax = Math.min(imgW, Math.ceil(Math.max(...xs)));
+    yMin = Math.max(0, Math.floor(Math.min(...ys)));
+    yMax = Math.min(imgH, Math.ceil(Math.max(...ys)));
+  }
 
   const data = workImageData.data;
 
@@ -219,15 +231,16 @@ function maskLocation(workImageData, location, imgW, imgH) {
 function detectMultiScale(imageData, fullWidth, fullHeight) {
   const results = [];
 
-  // 解析スケールの候補：元サイズ、0.75倍、0.5倍
-  const scales = [1.0, 0.75, 0.5];
-  const MAX_PER_SCALE = 4; // 1スケールあたりの上限
+  // 解析スケールの候補をやや細かく
+  const scales = [1.0, 0.9, 0.75, 0.6, 0.5];
+  const MAX_PER_SCALE = 10;   // 1スケールあたりの上限
+  const MAX_TOTAL = 25;       // 1フレーム全体の安全上限
 
   for (const scale of scales) {
     const sw = Math.floor(fullWidth * scale);
     const sh = Math.floor(fullHeight * scale);
 
-    if (sw < 40 || sh < 40) continue; // 小さすぎると意味がない
+    if (sw < 40 || sh < 40) continue; // 小さすぎるのは無意味
 
     offscreen.width = sw;
     offscreen.height = sh;
@@ -246,6 +259,7 @@ function detectMultiScale(imageData, fullWidth, fullHeight) {
 
     if (found.length > 0) {
       results.push(...found);
+      if (results.length >= MAX_TOTAL) break;
     }
   }
 
@@ -293,12 +307,7 @@ async function startCamera() {
     statusText.textContent = "カメラを起動中です...";
     overlayText.textContent = "起動中...";
 
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "environment",
-        frameRate: { ideal: 30, max: 60 }
-      }
-    });
+    stream = await navigatorMedia();
 
     video.srcObject = stream;
     video.setAttribute("playsinline", true);
@@ -344,6 +353,16 @@ function stopCamera() {
 
   startButton.disabled = false;
   stopButton.disabled = true;
+}
+
+// カメラ取得（関数に切り出し）
+async function navigatorMedia() {
+  return await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: "environment",
+      frameRate: { ideal: 30, max: 60 }
+    }
+  });
 }
 
 // ========= イベント =========
