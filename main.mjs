@@ -28,6 +28,7 @@ function isUrlLike(text) {
   return /^https?:\/\/[^\s]+$/i.test(text.trim());
 }
 
+// 軽量グレースケール＋コントラスト強調（小さいQR向け）
 function enhanceSimple(imageData) {
   const data = imageData.data;
   const contrast = 1.4;
@@ -52,7 +53,7 @@ function drawLine(begin, end, color) {
   ctx.beginPath();
   ctx.moveTo(begin.x, begin.y);
   ctx.lineTo(end.x, end.y);
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 2;
   ctx.strokeStyle = color;
   ctx.stroke();
 }
@@ -86,119 +87,100 @@ function addResult(codeText) {
 
   const textEl = document.createElement("div");
   textEl.className = "result-text";
-
-  const trimmed = codeText.trim();
-  if (isUrlLike(trimmed)) {
-    const a = document.createElement("a");
-    a.href = trimmed;
-    a.textContent = trimmed;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    textEl.appendChild(a);
-  } else {
-    textEl.textContent = codeText;
-  }
+  textEl.textContent = codeText;
 
   item.appendChild(meta);
   item.appendChild(textEl);
   resultsContainer.appendChild(item);
 }
 
-// ========= 検出ロジック =========
+// ========= 6×6 固定グリッド検出 =========
 
 /**
- * 1フレームの imageData から、マスクしながら最大 maxCount 個までコードを読む
+ * 1フレームを 6×6 に固定分割し、それぞれのセルについて
+ * jsQR をかけて読めたQRを返す。
+ *
  * 戻り値: [{ data, location }, ...]
  */
-function detectMultipleCodes(imageData, maxCount = 8) {
+function detectGridCodes(imageData) {
   const { width, height } = imageData;
+
+  const COLS = 6;
+  const ROWS = 6;
+
+  const cellW = width / COLS;
+  const cellH = height / ROWS;
+
   const results = [];
+  const alreadySeenThisFrame = new Set();
 
-  // 作業用コピー（元のimageDataはそのまま画面表示に使う）
-  let work = new ImageData(
-    new Uint8ClampedArray(imageData.data),
-    width,
-    height
-  );
+  // セルごとに左上→右下へ順番に試す
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const x0 = Math.floor(col * cellW);
+      const y0 = Math.floor(row * cellH);
+      const x1 = Math.floor((col + 1) * cellW);
+      const y1 = Math.floor((row + 1) * cellH);
 
-  for (let i = 0; i < maxCount; i++) {
-    // 1. 生画像でトライ
-    let code = jsQR(work.data, width, height, {
-      inversionAttempts: "attemptBoth",
-    });
+      // 少し内側を切り出す（セル境界付近のノイズを避ける）
+      const marginX = Math.floor((x1 - x0) * 0.1);
+      const marginY = Math.floor((y1 - y0) * 0.1);
 
-    // 2. ダメなら軽く強調して再トライ
-    if (!code) {
-      const enhanced = enhanceSimple(
-        new ImageData(
-          new Uint8ClampedArray(work.data),
-          width,
-          height
-        )
-      );
-      code = jsQR(enhanced.data, width, height, {
+      const x = x0 + marginX;
+      const y = y0 + marginY;
+      const w = Math.max(8, (x1 - x0) - marginX * 2);
+      const h = Math.max(8, (y1 - y0) - marginY * 2);
+
+      if (w <= 0 || h <= 0) continue;
+
+      const regionData = ctx.getImageData(x, y, w, h);
+
+      // 1回目：生画像
+      let code = jsQR(regionData.data, w, h, {
         inversionAttempts: "attemptBoth",
       });
+
+      // 2回目：軽く強調
+      if (!code) {
+        const enhanced = enhanceSimple(
+          new ImageData(
+            new Uint8ClampedArray(regionData.data),
+            w,
+            h
+          )
+        );
+        code = jsQR(enhanced.data, w, h, {
+          inversionAttempts: "attemptBoth",
+        });
+      }
+
+      if (!code || !code.data) continue;
+
+      const text = code.data;
+
+      // このフレーム内で重複していたらスキップ
+      if (alreadySeenThisFrame.has(text)) continue;
+      alreadySeenThisFrame.add(text);
+
+      // 領域内座標 → フルキャンバス座標に変換
+      function mapPoint(p) {
+        return { x: p.x + x, y: p.y + y };
+      }
+
+      results.push({
+        data: text,
+        location: {
+          topLeftCorner: mapPoint(code.location.topLeftCorner),
+          topRightCorner: mapPoint(code.location.topRightCorner),
+          bottomRightCorner: mapPoint(code.location.bottomRightCorner),
+          bottomLeftCorner: mapPoint(code.location.bottomLeftCorner),
+        },
+        cell: { row, col }
+      });
     }
-
-    if (!code) {
-      break; // これ以上は見つからなさそう
-    }
-
-    if (!code.data || seenCodes.has(code.data)) {
-      // 既知のコード or 空文字 → この領域だけ塗って続行
-      maskCodeArea(work, code.location, width, height);
-      continue;
-    }
-
-    // 新規コード
-    results.push({
-      data: code.data,
-      location: code.location
-    });
-
-    // 次のループではこのコード領域を真っ白にして、他のコードを探す
-    maskCodeArea(work, code.location, width, height);
   }
 
   return results;
-}
-
-/**
- * 検出されたQRコードの領域を、作業用イメージ work の上で白く塗りつぶす
- * （次の jsQR ではこのコードを無視させるため）
- */
-function maskCodeArea(work, location, imgW, imgH) {
-  // だいたいの外接矩形をとる
-  const xs = [
-    location.topLeftCorner.x,
-    location.topRightCorner.x,
-    location.bottomRightCorner.x,
-    location.bottomLeftCorner.x
-  ];
-  const ys = [
-    location.topLeftCorner.y,
-    location.topRightCorner.y,
-    location.bottomRightCorner.y,
-    location.bottomLeftCorner.y
-  ];
-
-  let xMin = Math.max(0, Math.min(...xs) - 4);
-  let xMax = Math.min(imgW, Math.max(...xs) + 4);
-  let yMin = Math.max(0, Math.min(...ys) - 4);
-  let yMax = Math.min(imgH, Math.max(...ys) + 4);
-
-  const data = work.data;
-
-  for (let y = yMin; y < yMax; y++) {
-    for (let x = xMin; x < xMax; x++) {
-      const idx = (y * imgW + x) * 4;
-      data[idx] = 255;     // R
-      data[idx + 1] = 255; // G
-      data[idx + 2] = 255; // B
-      // alpha はそのまま or 255
-    }
-  }
 }
 
 // ========= メインループ =========
@@ -215,11 +197,12 @@ function tick() {
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    // ★ このフレームでまとめて複数検出（上限はほどほどに）
-    const codes = detectMultipleCodes(imageData, 8);
+    // ★ このフレームで 6×6 グリッド全セルを走査
+    const codes = detectGridCodes(imageData);
 
     for (const c of codes) {
       const loc = c.location;
+
       drawLine(loc.topLeftCorner, loc.topRightCorner, "#FF3B58");
       drawLine(loc.topRightCorner, loc.bottomRightCorner, "#FF3B58");
       drawLine(loc.bottomRightCorner, loc.bottomLeftCorner, "#FF3B58");
@@ -256,7 +239,7 @@ async function startCamera() {
     stopButton.disabled = false;
 
     overlayText.classList.add("hidden");
-    statusText.textContent = "カメラ起動中。複数のQRコードを同時に映しても順番に読み取ります。";
+    statusText.textContent = "カメラ起動中。6×6のQR表を画面いっぱいになるくらいに映してください。";
     canvas.hidden = false;
 
     tickHandle = requestAnimationFrame(tick);
@@ -291,8 +274,6 @@ function stopCamera() {
   startButton.disabled = false;
   stopButton.disabled = true;
 }
-
-// ========= イベント =========
 
 startButton.addEventListener("click", startCamera);
 stopButton.addEventListener("click", stopCamera);
